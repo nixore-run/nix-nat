@@ -285,14 +285,29 @@ show_all_nat() {
   printf "%-8s %-16s %-10s %-15s\n" "编号" "内部IP" "SSH端口" "业务端口范围"
   echo "----------------------------------------------------"
 
-  iptables -t nat -L PREROUTING -n | grep "10\.0\.0\." | awk '{print $NF}' | \
-    grep -oE '10\.0\.0\.[0-9]+' | awk -F'.' '{print $4}' | sort -n | uniq | while read -r last; do
-      calc_ports "$last"
-      printf "%-8s %-16s %-10s %-15s\n" "$last" "${NET_PREFIX}${last}" "$SSH_PORT" "${BLOCK_START}-${BLOCK_END}"
-    done
+  local lasts
+  lasts="$(
+    iptables -t nat -S PREROUTING 2>/dev/null \
+      | grep -oE '10\.0\.0\.[0-9]+' \
+      | awk -F'.' '{print $4}' \
+      | sort -n | uniq || true
+  )"
+
+  if [[ -z "$lasts" ]]; then
+    echo "(暂无 NAT 映射规则)"
+    echo "----------------------------------------------------"
+    return 0
+  fi
+
+  while read -r last; do
+    [[ -z "$last" ]] && continue
+    calc_ports "$last"
+    printf "%-8s %-16s %-10s %-15s\n" "$last" "${NET_PREFIX}${last}" "$SSH_PORT" "${BLOCK_START}-${BLOCK_END}"
+  done <<< "$lasts"
 
   echo "----------------------------------------------------"
 }
+
 
 # -----------------------
 # 菜单
