@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 # ===============================================
-# NAT 映射管理脚本 (交互菜单版 v3.3 完整版)
-# - 端口块推断：只看 PREROUTING 第一条 a:b DNAT（最快）
-# - 推断失败：让用户输入端口块（默认20），保证可用
-# - 查看单个：从规则解析（不依赖公式），列表有就一定查得到
-# - 删除修复：不存在就跳过，不假删；批量同理
-# - 自动选择后端：iptables / iptables-nft / iptables-legacy 谁的 PREROUTING 有 DNAT 用谁
+# NAT 映射管理脚本 (交互菜单版 v3.4)
 # ===============================================
 
 set -euo pipefail
@@ -113,10 +108,14 @@ enable_forward() {
   fi
 }
 
+# -----------------------
+# 持久化
+# -----------------------
 persist_rules() {
   info "持久化 iptables 规则到 $RULES_FILE"
   mkdir -p "$(dirname "$RULES_FILE")"
-  iptables-save > "$RULES_FILE"
+  # 关键：过滤掉 legacy Warning，只保留真实规则内容
+  iptables-save 2>/dev/null > "$RULES_FILE"
   ok "规则已保存"
 }
 
@@ -182,7 +181,7 @@ detect_ports_per_host_fast() {
 ask_ports_per_host() {
   echo "========================================="
   warn "无法从现有规则推断端口块，或未检测到 NAT 规则。"
-  echo "你可以自定义每台机器映射的业务端口数量。"
+  echo "请自定义每台机器映射的业务端口数量。"
   echo "默认：${PORTS_PER_HOST_DEFAULT}"
   read -rp "请输入每台机器业务端口数量（回车默认${PORTS_PER_HOST_DEFAULT}）: " p
   p="$(strip_cr "$p")"
@@ -325,7 +324,6 @@ show_all_nat() {
 menu() {
   clear
   echo "====== Nixore NAT 映射管理 ========"
-  echo "iptables 后端：$IPT"
   echo "当前每台机器业务端口数量：${PORTS_PER_HOST}"
   echo "-----------------------------------------"
   echo "1. 添加单个映射"
@@ -356,8 +354,11 @@ menu() {
 
       info "批量添加中 (${start}-${end})..."
       local old="$AUTO_PERSIST"; AUTO_PERSIST=0
-      for (( i=start; i<=end; i++ )); do add_nat "$i" || true; done
+      for (( i=start; i<=end; i++ )); do
+        add_nat "$i" || true
+      done
       AUTO_PERSIST="$old"
+
       persist_rules
       ok "批量添加完成并已持久化 (${start}-${end})"
       ;;
@@ -375,11 +376,45 @@ menu() {
       (( start > end )) && { err "起始不能大于结束"; read -rp "按回车返回菜单..." _; menu; }
 
       info "批量删除中 (${start}-${end})..."
-      local old="$AUTO_PERSIST"; AUTO_PERSIST=0
-      for (( i=start; i<=end; i++ )); do del_nat "$i" || true; done
+
+      local old="$AUTO_PERSIST"
+      AUTO_PERSIST=0
+
+      local del_count=0
+      local skip_count=0
+
+      for (( i=start; i<=end; i++ )); do
+        local ip="${NET_PREFIX}${i}"
+        local rules
+        rules="$(
+          $IPT -t nat -S PREROUTING 2>/dev/null \
+            | grep -F "DNAT" \
+            | grep -F "$ip" || true
+        )"
+
+        if [[ -z "$rules" ]]; then
+          ((skip_count++))
+          continue
+        fi
+
+        while read -r r; do
+          [[ -z "$r" ]] && continue
+          $IPT -t nat ${r/-A /-D } 2>/dev/null || true
+        done <<< "$rules"
+
+        $IPT -D FORWARD -d "$ip" -j ACCEPT 2>/dev/null || true
+        $IPT -D FORWARD -s "$ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+
+        ((del_count++))
+      done
+
       AUTO_PERSIST="$old"
+
       persist_rules
+      ok "已删除 ${del_count} 台机器映射"
+      warn "跳过 ${skip_count} 台（无规则）"
       ok "批量删除完成并已持久化 (${start}-${end})"
+      # ==========================================
       ;;
     5)
       read -rp "请输入要查看的主机号 (${MIN_HOST}-${MAX_HOST}): " n
