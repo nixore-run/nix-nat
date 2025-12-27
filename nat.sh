@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # ===============================================
-# NAT 映射管理脚本 (交互菜单版 v2.9)
-# - 支持 Debian/Ubuntu/AlmaLinux/Rocky/CentOS
-# - 自动识别 iptables 后端（nft/legacy）并使用存在规则的那套
-# - 启动时从已有 NAT 规则推断端口块：从 100 开始逐个找直到 250
-# - 推断兼容：--to-destination  / --to-destination=  + :22
-# - 删除修复：按现有规则反查删除（找不到就跳过）
-# - 不会因为推断失败直接退出（只警告，不破坏体系）
+# NAT 映射管理脚本 (交互菜单版 v3.1)
+# - 端口块推断：只看 PREROUTING 第一条 a:b 端口范围规则（最快）
+# - 推断失败：允许用户输入端口块（默认20）保证脚本可用
+# - 删除修复：按现有规则反查删除，找不到就跳过，不假删
+# - 自动选择后端：iptables / iptables-nft / iptables-legacy 谁有 DNAT 规则用谁
 # ===============================================
 
 set -euo pipefail
@@ -35,31 +33,21 @@ ok()   { echo -e "\033[1;32m✅\033[0m $*"; }
 warn() { echo -e "\033[1;33m⚠️\033[0m $*"; }
 err()  { echo -e "\033[1;31m❌\033[0m $*"; }
 
-strip_cr() {
-  local v="${1:-}"
-  v="${v//$'\r'/}"
-  echo "$v"
-}
+strip_cr() { echo "${1//$'\r'/}"; }
 
 require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    err "请使用 root 运行：sudo $0"
-    exit 1
-  fi
+  [[ "${EUID}" -eq 0 ]] || { err "请使用 root 运行：sudo $0"; exit 1; }
 }
 
 detect_pkg_manager() {
-  if command -v apt-get >/dev/null 2>&1; then echo "apt"
-  elif command -v dnf >/dev/null 2>&1; then echo "dnf"
-  elif command -v yum >/dev/null 2>&1; then echo "yum"
-  elif command -v zypper >/dev/null 2>&1; then echo "zypper"
-  else echo "unknown"; fi
+  if command -v apt-get >/dev/null 2>&1; then echo apt
+  elif command -v dnf >/dev/null 2>&1; then echo dnf
+  elif command -v yum >/dev/null 2>&1; then echo yum
+  elif command -v zypper >/dev/null 2>&1; then echo zypper
+  else echo unknown; fi
 }
 
 install_deps() {
-  local pm
-  pm="$(detect_pkg_manager)"
-
   if command -v iptables >/dev/null 2>&1 && command -v iptables-save >/dev/null 2>&1 && command -v iptables-restore >/dev/null 2>&1; then
     ok "依赖已满足：iptables / iptables-save / iptables-restore"
     return
@@ -67,7 +55,9 @@ install_deps() {
 
   [[ "$AUTO_INSTALL_DEPS" == "1" ]] || { err "缺少依赖且 AUTO_INSTALL_DEPS=0"; exit 1; }
 
+  local pm; pm="$(detect_pkg_manager)"
   info "检测到缺少依赖，开始自动安装 iptables..."
+
   case "$pm" in
     apt) apt-get update -y && apt-get install -y iptables ;;
     dnf) dnf install -y iptables iptables-services || dnf install -y iptables ;;
@@ -79,18 +69,18 @@ install_deps() {
 }
 
 # -----------------------
-# 后端检测：谁有 NAT 规则就用谁（兼容 = 或空格）
+# 后端检测：谁有 DNAT 规则用谁（不靠 fragile pipeline）
 # -----------------------
 backend_has_nat() {
   local cmd="$1"
   command -v "$cmd" >/dev/null 2>&1 || return 1
-  "$cmd" -t nat -S PREROUTING 2>/dev/null \
-    | grep -E -- '-j DNAT' \
-    | grep -E -- "--to-destination[= ]${NET_PREFIX//./\\.}" >/dev/null 2>&1
+  local rules
+  rules="$("$cmd" -t nat -S PREROUTING 2>/dev/null || true)"
+  [[ "$rules" == *"DNAT"* && "$rules" == *"--dport"* ]]
 }
 
 detect_iptables_backend() {
-  local candidates=("iptables" "iptables-legacy" "iptables-nft")
+  local candidates=("iptables" "iptables-nft" "iptables-legacy")
   for c in "${candidates[@]}"; do
     if backend_has_nat "$c"; then
       IPT="$c"
@@ -106,6 +96,9 @@ has_existing_nat_rules() {
   backend_has_nat "$IPT"
 }
 
+# -----------------------
+# 端口计算
+# -----------------------
 calc_ports() {
   local last="$1"
   SSH_PORT=$((30000 + last))
@@ -114,33 +107,19 @@ calc_ports() {
 }
 
 # -----------------------
-# 推断端口块：从 100→250 找到第一个存在映射的 IP
-# 兼容 --to-destination= 以及 :22
+# 端口块推断（最快）：只看第一条 a:b 端口范围 DNAT 规则
 # -----------------------
-detect_ports_per_host_from_rules() {
-  local ip="" last="" ip_esc range start end size
-  local rules="$($IPT -t nat -S PREROUTING 2>/dev/null || true)"
+detect_ports_per_host_fast() {
+  local rules range start end size
+  rules="$($IPT -t nat -S PREROUTING 2>/dev/null || true)"
 
-  for ((i=MIN_HOST; i<=MAX_HOST; i++)); do
-    ip="${NET_PREFIX}${i}"
-    ip_esc="${ip//./\\.}"
-    # 匹配：--to-destination 10.0.0.x 或 --to-destination=10.0.0.x
-    if echo "$rules" | grep -Eq -- "--to-destination[= ]${ip_esc}([:$]|$)"; then
-      last="$i"
-      break
-    fi
-  done
-
-  [[ -n "$last" ]] || return 1
-  ip="${NET_PREFIX}${last}"
-  ip_esc="${ip//./\\.}"
-
-  # 找业务端口范围（包含 a:b 的那条）
+  # 找第一条包含 a:b 的 --dport
   range="$(
     echo "$rules" \
-      | grep -E -- "--to-destination[= ]${ip_esc}([:$]|$)" \
-      | grep -oE -- '[0-9]+:[0-9]+' \
-      | head -n 1 || true
+      | grep -E -- 'DNAT' \
+      | grep -oE -- '--dport [0-9]+:[0-9]+' \
+      | head -n 1 \
+      | awk '{print $2}' || true
   )"
 
   [[ -n "$range" ]] || return 1
@@ -149,48 +128,51 @@ detect_ports_per_host_from_rules() {
   end="${range#*:}"
   size=$(( end - start + 1 ))
 
-  if (( size > 0 && size <= 65535 )); then
-    PORTS_PER_HOST="$size"
-    ok "检测到现有规则：$ip 端口范围 ${start}-${end} → 每台业务端口数量 = $PORTS_PER_HOST"
-    return 0
-  fi
+  (( size > 0 && size <= 65535 )) || return 1
 
-  return 1
+  PORTS_PER_HOST="$size"
+  ok "快速推断成功：端口范围 ${start}-${end} → 每台业务端口数量 = $PORTS_PER_HOST"
+  return 0
 }
 
-choose_ports_per_host_when_empty() {
+# -----------------------
+# 推断失败/无规则：让用户输入（默认20）
+# -----------------------
+ask_ports_per_host() {
   echo "========================================="
-  echo "未检测到现有 NAT 映射规则。"
+  warn "无法从现有规则推断端口块，或未检测到 NAT 规则。"
   echo "你可以自定义每台机器映射的业务端口数量。"
   echo "默认：${PORTS_PER_HOST_DEFAULT}"
   read -rp "请输入每台机器业务端口数量（回车默认${PORTS_PER_HOST_DEFAULT}）: " p
   p="$(strip_cr "$p")"
 
-  if [[ -z "${p}" ]]; then
-    PORTS_PER_HOST="${PORTS_PER_HOST_DEFAULT}"
+  if [[ -z "$p" ]]; then
+    PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
   else
     [[ "$p" =~ ^[0-9]+$ ]] || { err "必须输入数字"; exit 1; }
     (( p >= 1 && p <= 2000 )) || { err "端口数量建议 1-2000"; exit 1; }
     PORTS_PER_HOST="$p"
   fi
+
   ok "已设置：每台机器业务端口数量 = ${PORTS_PER_HOST}"
   echo "========================================="
 }
 
 init_ports_per_host() {
   if has_existing_nat_rules; then
-    # 有规则：尝试推断，推断失败也不退出（只警告）
-    if ! detect_ports_per_host_from_rules; then
-      warn "检测到 NAT 规则，但推断端口块失败。"
-      warn "为避免破坏体系，将临时使用默认：${PORTS_PER_HOST_DEFAULT}（仅影响新增映射）"
-      PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
+    # 有规则：优先快速推断，推断失败就让用户输入，保证可用
+    if ! detect_ports_per_host_fast; then
+      ask_ports_per_host
     fi
   else
-    PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
-    choose_ports_per_host_when_empty
+    # 无规则：直接让用户输入
+    ask_ports_per_host
   fi
 }
 
+# -----------------------
+# IP forward
+# -----------------------
 enable_forward() {
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   local sysctl_conf="/etc/sysctl.d/99-nixore-ipforward.conf"
@@ -202,6 +184,9 @@ enable_forward() {
   fi
 }
 
+# -----------------------
+# 持久化
+# -----------------------
 persist_rules() {
   info "持久化 iptables 规则到 $RULES_FILE"
   mkdir -p "$(dirname "$RULES_FILE")"
@@ -238,6 +223,9 @@ EOF
   fi
 }
 
+# -----------------------
+# 输入校验
+# -----------------------
 validate_host() {
   local n="$1"
   [[ "$n" =~ ^[0-9]+$ ]] || { err "主机号必须是数字"; return 1; }
@@ -245,6 +233,9 @@ validate_host() {
   return 0
 }
 
+# -----------------------
+# NAT 添加
+# -----------------------
 add_nat() {
   local last="$1"
   validate_host "$last" || return 1
@@ -277,18 +268,19 @@ add_nat() {
   [[ "$AUTO_PERSIST" == "1" ]] && persist_rules
 }
 
-# 删除修复：按现有规则反查删除（找不到就跳过）
+# -----------------------
+# 删除（修复：不存在就跳过）
+# -----------------------
 del_nat() {
   local last="$1"
   validate_host "$last" || return 1
   local ip="${NET_PREFIX}${last}"
-  local ip_esc="${ip//./\\.}"
 
   local rules
   rules="$(
     $IPT -t nat -S PREROUTING 2>/dev/null \
-      | grep -E -- '-j DNAT' \
-      | grep -E -- "--to-destination[= ]${ip_esc}([:$]|$)" || true
+      | grep -F "DNAT" \
+      | grep -F "$ip" || true
   )"
 
   if [[ -z "$rules" ]]; then
@@ -304,17 +296,19 @@ del_nat() {
   $IPT -D FORWARD -d "$ip" -j ACCEPT 2>/dev/null || true
   $IPT -D FORWARD -s "$ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 
-  ok "已删除 $ip 的映射（按现有规则反查删除）"
+  ok "已删除 $ip 的映射"
   [[ "$AUTO_PERSIST" == "1" ]] && persist_rules
 }
 
+# -----------------------
+# 查看
+# -----------------------
 show_one_nat() {
   local last="$1"
   validate_host "$last" || return 1
   local ip="${NET_PREFIX}${last}"
-  local ip_esc="${ip//./\\.}"
 
-  if ! $IPT -t nat -S PREROUTING 2>/dev/null | grep -Eq -- "--to-destination[= ]${ip_esc}([:$]|$)"; then
+  if ! $IPT -t nat -S PREROUTING 2>/dev/null | grep -Fq "$ip"; then
     err "未找到 $ip 的 NAT 规则"
     return 1
   fi
@@ -358,6 +352,9 @@ show_all_nat() {
   echo "每台机器业务端口数量：${PORTS_PER_HOST}"
 }
 
+# -----------------------
+# 菜单
+# -----------------------
 menu() {
   clear
   echo "======== Nixore NAT 映射管理 ========"
