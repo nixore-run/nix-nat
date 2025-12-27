@@ -417,7 +417,6 @@ show_all_nat() {
 menu() {
   clear
   echo "======== Nixore NAT 映射管理 ========"
-  echo "iptables 后端：$IPT"
   echo "当前每台机器业务端口数量：${PORTS_PER_HOST}"
   echo "-----------------------------------------"
   echo "1. 添加单个映射"
