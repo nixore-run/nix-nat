@@ -397,6 +397,8 @@ menu() {
   echo "7. 退出"
   echo "========================================="
   read -rp "请输入选项 [1-7]: " choice
+  printf 'DEBUG(choice)=[%q]\n' "$choice"
+
 
   case "$choice" in
     1)
