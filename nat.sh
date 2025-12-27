@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # ===============================================
-# NAT 映射管理脚本 (交互菜单版 v2.1)
+# NAT 映射管理脚本 (交互菜单版 v2.2)
 # - 支持 Debian/Ubuntu/AlmaLinux/Rocky/CentOS
+# - 新增：启动时自动检测已存在规则，推断端口块大小
+#   * 如果已存在 NAT 映射：不允许修改端口块大小（自动跟随现状）
+#   * 如果没有任何映射：启动时可自定义端口块大小（默认20）
 # ===============================================
 
 set -euo pipefail
@@ -13,6 +16,10 @@ SUBNET_CIDR="10.0.0.0/24"
 NET_PREFIX="10.0.0."
 MIN_HOST=100
 MAX_HOST=250
+
+# 默认每台机器业务端口数量（无规则时使用 / 可输入修改）
+PORTS_PER_HOST_DEFAULT=20
+PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
 
 # 自动持久化：单个操作是否立即保存（批量时会临时关闭）
 AUTO_PERSIST="${AUTO_PERSIST:-1}"
@@ -107,14 +114,86 @@ install_deps() {
   fi
 }
 
-# -----------------------
-# 端口计算
-# -----------------------
 calc_ports() {
   local last="$1"
   SSH_PORT=$((30000 + last))
-  BLOCK_START=$((40000 + (last - 100)*20 + 1))
-  BLOCK_END=$((BLOCK_START + 19))
+  BLOCK_START=$((40000 + (last - MIN_HOST)*PORTS_PER_HOST + 1))
+  BLOCK_END=$((BLOCK_START + PORTS_PER_HOST - 1))
+}
+
+has_existing_nat_rules() {
+  iptables -t nat -S PREROUTING 2>/dev/null | grep -qE '10\.0\.0\.[0-9]+' && return 0
+  return 1
+}
+
+# 从现有规则推断端口块大小（抓取第一条 --dport a:b 的规则）
+detect_ports_per_host_from_rules() {
+  local range
+  range="$(
+    iptables -t nat -S PREROUTING 2>/dev/null \
+      | grep -E -- '--dport [0-9]+:[0-9]+' \
+      | head -n 1 \
+      | grep -oE '--dport [0-9]+:[0-9]+' \
+      | awk '{print $2}' || true
+  )"
+
+  if [[ -z "$range" ]]; then
+    return 1
+  fi
+
+  local start end size
+  start="${range%:*}"
+  end="${range#*:}"
+  size=$(( end - start + 1 ))
+
+  if (( size > 0 && size <= 65535 )); then
+    PORTS_PER_HOST="$size"
+    ok "检测到已有 NAT 映射规则：自动推断每台业务端口数量 = ${PORTS_PER_HOST}"
+    return 0
+  fi
+
+  return 1
+}
+
+# 没有规则时才允许选择
+choose_ports_per_host_when_empty() {
+  echo "========================================="
+  echo "未检测到现有 NAT 映射规则。"
+  echo "你可以自定义每台机器映射的业务端口数量。"
+  echo "默认：${PORTS_PER_HOST_DEFAULT}"
+  read -rp "请输入每台机器业务端口数量（回车默认${PORTS_PER_HOST_DEFAULT}）: " p
+
+  if [[ -z "${p}" ]]; then
+    PORTS_PER_HOST="${PORTS_PER_HOST_DEFAULT}"
+  else
+    if ! [[ "$p" =~ ^[0-9]+$ ]]; then
+      err "必须输入数字"
+      exit 1
+    fi
+    if (( p < 1 || p > 2000 )); then
+      err "端口数量建议 1-2000 以内"
+      exit 1
+    fi
+    PORTS_PER_HOST="$p"
+  fi
+
+  ok "已设置：每台机器业务端口数量 = ${PORTS_PER_HOST}"
+  echo "========================================="
+}
+
+init_ports_per_host() {
+  if has_existing_nat_rules; then
+    # 有规则：必须跟随现状，不给改
+    if ! detect_ports_per_host_from_rules; then
+      # 有映射但没抓到范围（极少数情况），兜底用默认值并提示
+      PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
+      warn "检测到 NAT 映射规则，但未能推断端口块大小，兜底使用默认值：${PORTS_PER_HOST_DEFAULT}"
+    fi
+  else
+    # 无规则：允许选择
+    PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
+    choose_ports_per_host_when_empty
+  fi
 }
 
 # -----------------------
@@ -129,7 +208,6 @@ enable_forward() {
   if [[ -d /etc/sysctl.d ]]; then
     echo "net.ipv4.ip_forward=1" > "$sysctl_conf"
   else
-    # 兜底：老系统没有 sysctl.d
     grep -q '^net\.ipv4\.ip_forward=1' /etc/sysctl.conf 2>/dev/null || \
       echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
   fi
@@ -146,7 +224,6 @@ persist_rules() {
 }
 
 ensure_restore_service() {
-  # 没有 systemd 的极少数系统：提示用户手动 restore
   if ! command -v systemctl >/dev/null 2>&1; then
     warn "未检测到 systemd，无法自动开机恢复规则。你需要手动设置开机执行：iptables-restore < $RULES_FILE"
     return
@@ -205,7 +282,7 @@ add_nat() {
 
   echo -e "\n[+] 添加映射: $ip"
   echo "SSH端口: $SSH_PORT"
-  echo "业务端口: ${BLOCK_START}-${BLOCK_END}"
+  echo "业务端口: ${BLOCK_START}-${BLOCK_END} （每台 ${PORTS_PER_HOST} 个）"
 
   enable_forward
 
@@ -272,7 +349,7 @@ show_one_nat() {
     echo "----------------------------------"
     echo "内部 IP  : $ip"
     echo "SSH端口  : $SSH_PORT"
-    echo "业务端口 : ${BLOCK_START}-${BLOCK_END}"
+    echo "业务端口 : ${BLOCK_START}-${BLOCK_END} （每台 ${PORTS_PER_HOST} 个）"
     echo "----------------------------------"
   else
     err "未找到 $ip 的 NAT 规则"
@@ -306,8 +383,8 @@ show_all_nat() {
   done <<< "$lasts"
 
   echo "----------------------------------------------------"
+  echo "每台机器业务端口数量：${PORTS_PER_HOST}"
 }
-
 
 # -----------------------
 # 菜单
@@ -315,6 +392,8 @@ show_all_nat() {
 menu() {
   clear
   echo "======== Nixore NAT 映射管理 ========"
+  echo "当前每台机器业务端口数量：${PORTS_PER_HOST}"
+  echo "-----------------------------------------"
   echo "1. 添加单个映射"
   echo "2. 批量添加映射"
   echo "3. 删除单个映射"
@@ -344,7 +423,7 @@ menu() {
         menu
       fi
 
-      info "批量添加中 (${start}-${end})..."
+      info "批量添加中 (${start}-${end})...（每台 ${PORTS_PER_HOST} 个业务端口）"
       local old="$AUTO_PERSIST"
       AUTO_PERSIST=0
       for (( i=start; i<=end; i++ )); do
@@ -415,6 +494,7 @@ main() {
   install_deps
   ensure_restore_service
   enable_forward
+  init_ports_per_host
   menu
 }
 
