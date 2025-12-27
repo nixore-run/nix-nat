@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
 # ===============================================
-# NAT 映射管理脚本 (交互菜单版 v2.8)
+# NAT 映射管理脚本 (交互菜单版 v2.9)
 # - 支持 Debian/Ubuntu/AlmaLinux/Rocky/CentOS
 # - 自动识别 iptables 后端（nft/legacy）并使用存在规则的那套
 # - 启动时从已有 NAT 规则推断端口块：从 100 开始逐个找直到 250
-# - 有规则：端口块锁定，不允许改，防止规则体系乱掉
-# - 无规则：允许输入端口块大小（默认20）
-# - 删除修复：按现有规则反查删除（找不到就跳过，不会假删）
-# - 保留 v2.1 原菜单：查看单个/全部映射等
+# - 推断兼容：--to-destination  / --to-destination=  + :22
+# - 删除修复：按现有规则反查删除（找不到就跳过）
+# - 不会因为推断失败直接退出（只警告，不破坏体系）
 # ===============================================
 
 set -euo pipefail
 
-# -----------------------
-# 可配置参数
-# -----------------------
 SUBNET_CIDR="10.0.0.0/24"
 NET_PREFIX="10.0.0."
 MIN_HOST=100
@@ -28,20 +24,12 @@ RULES_FILE="${RULES_FILE:-/etc/iptables/rules.v4}"
 SYSTEMD_SERVICE="${SYSTEMD_SERVICE:-/etc/systemd/system/iptables-restore.service}"
 AUTO_INSTALL_DEPS="${AUTO_INSTALL_DEPS:-1}"
 
-# -----------------------
-# 全局变量
-# -----------------------
 SSH_PORT=""
 BLOCK_START=""
 BLOCK_END=""
 
 IPT="iptables"
-IPT_SAVE="iptables-save"
-IPT_RESTORE="iptables-restore"
 
-# -----------------------
-# 输出辅助
-# -----------------------
 info() { echo -e "\033[1;34m[*]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m✅\033[0m $*"; }
 warn() { echo -e "\033[1;33m⚠️\033[0m $*"; }
@@ -60,21 +48,12 @@ require_root() {
   fi
 }
 
-# -----------------------
-# 发行版检测 & 依赖安装
-# -----------------------
 detect_pkg_manager() {
-  if command -v apt-get >/dev/null 2>&1; then
-    echo "apt"
-  elif command -v dnf >/dev/null 2>&1; then
-    echo "dnf"
-  elif command -v yum >/dev/null 2>&1; then
-    echo "yum"
-  elif command -v zypper >/dev/null 2>&1; then
-    echo "zypper"
-  else
-    echo "unknown"
-  fi
+  if command -v apt-get >/dev/null 2>&1; then echo "apt"
+  elif command -v dnf >/dev/null 2>&1; then echo "dnf"
+  elif command -v yum >/dev/null 2>&1; then echo "yum"
+  elif command -v zypper >/dev/null 2>&1; then echo "zypper"
+  else echo "unknown"; fi
 }
 
 install_deps() {
@@ -86,51 +65,32 @@ install_deps() {
     return
   fi
 
-  if [[ "$AUTO_INSTALL_DEPS" != "1" ]]; then
-    err "缺少依赖，但 AUTO_INSTALL_DEPS=0，无法自动安装。请手动安装 iptables。"
-    exit 1
-  fi
+  [[ "$AUTO_INSTALL_DEPS" == "1" ]] || { err "缺少依赖且 AUTO_INSTALL_DEPS=0"; exit 1; }
 
   info "检测到缺少依赖，开始自动安装 iptables..."
-
   case "$pm" in
-    apt)
-      apt-get update -y
-      apt-get install -y iptables
-      ;;
-    dnf)
-      dnf install -y iptables iptables-services || dnf install -y iptables
-      ;;
-    yum)
-      yum install -y iptables iptables-services || yum install -y iptables
-      ;;
-    zypper)
-      zypper --non-interactive install iptables
-      ;;
-    *)
-      err "无法识别包管理器，请手动安装 iptables。"
-      exit 1
-      ;;
+    apt) apt-get update -y && apt-get install -y iptables ;;
+    dnf) dnf install -y iptables iptables-services || dnf install -y iptables ;;
+    yum) yum install -y iptables iptables-services || yum install -y iptables ;;
+    zypper) zypper --non-interactive install iptables ;;
+    *) err "无法识别包管理器，请手动安装 iptables"; exit 1 ;;
   esac
-
   ok "依赖安装完成"
 }
 
 # -----------------------
-# 后端检测：谁有 NAT 规则就用谁
+# 后端检测：谁有 NAT 规则就用谁（兼容 = 或空格）
 # -----------------------
 backend_has_nat() {
   local cmd="$1"
   command -v "$cmd" >/dev/null 2>&1 || return 1
-
   "$cmd" -t nat -S PREROUTING 2>/dev/null \
     | grep -E -- '-j DNAT' \
-    | grep -E -- "--to-destination ${NET_PREFIX//./\\.}" >/dev/null 2>&1
+    | grep -E -- "--to-destination[= ]${NET_PREFIX//./\\.}" >/dev/null 2>&1
 }
 
 detect_iptables_backend() {
   local candidates=("iptables" "iptables-legacy" "iptables-nft")
-
   for c in "${candidates[@]}"; do
     if backend_has_nat "$c"; then
       IPT="$c"
@@ -138,19 +98,14 @@ detect_iptables_backend() {
       return 0
     fi
   done
-
   IPT="iptables"
   info "未检测到现有 NAT 规则，默认使用：$IPT"
-  return 0
 }
 
 has_existing_nat_rules() {
   backend_has_nat "$IPT"
 }
 
-# -----------------------
-# 端口计算
-# -----------------------
 calc_ports() {
   local last="$1"
   SSH_PORT=$((30000 + last))
@@ -159,41 +114,37 @@ calc_ports() {
 }
 
 # -----------------------
-# 从规则推断端口块：100 没有就 101、102、… 直到 250
+# 推断端口块：从 100→250 找到第一个存在映射的 IP
+# 兼容 --to-destination= 以及 :22
 # -----------------------
 detect_ports_per_host_from_rules() {
-  local ip="" last=""
+  local ip="" last="" ip_esc range start end size
+  local rules="$($IPT -t nat -S PREROUTING 2>/dev/null || true)"
 
-  # 逐个 host 探测：找到第一个存在 DNAT 的
   for ((i=MIN_HOST; i<=MAX_HOST; i++)); do
     ip="${NET_PREFIX}${i}"
-    if $IPT -t nat -S PREROUTING 2>/dev/null | grep -qF -- "--to-destination $ip"; then
-      last="$i"
-      break
-    fi
-    # 也兼容 --to-destination 10.0.0.x:22
-    if $IPT -t nat -S PREROUTING 2>/dev/null | grep -qF -- "--to-destination ${ip}:"; then
+    ip_esc="${ip//./\\.}"
+    # 匹配：--to-destination 10.0.0.x 或 --to-destination=10.0.0.x
+    if echo "$rules" | grep -Eq -- "--to-destination[= ]${ip_esc}([:$]|$)"; then
       last="$i"
       break
     fi
   done
 
-  [[ -z "$last" ]] && return 1
-
+  [[ -n "$last" ]] || return 1
   ip="${NET_PREFIX}${last}"
+  ip_esc="${ip//./\\.}"
 
-  # 找该IP对应的业务端口范围规则（包含 a:b 的）
-  local range
+  # 找业务端口范围（包含 a:b 的那条）
   range="$(
-    $IPT -t nat -S PREROUTING 2>/dev/null \
-      | grep -F -- "$ip" \
+    echo "$rules" \
+      | grep -E -- "--to-destination[= ]${ip_esc}([:$]|$)" \
       | grep -oE -- '[0-9]+:[0-9]+' \
       | head -n 1 || true
   )"
 
-  [[ -z "$range" ]] && return 1
+  [[ -n "$range" ]] || return 1
 
-  local start end size
   start="${range%:*}"
   end="${range#*:}"
   size=$(( end - start + 1 ))
@@ -218,43 +169,30 @@ choose_ports_per_host_when_empty() {
   if [[ -z "${p}" ]]; then
     PORTS_PER_HOST="${PORTS_PER_HOST_DEFAULT}"
   else
-    if ! [[ "$p" =~ ^[0-9]+$ ]]; then
-      err "必须输入数字"
-      exit 1
-    fi
-    if (( p < 1 || p > 2000 )); then
-      err "端口数量建议 1-2000 以内"
-      exit 1
-    fi
+    [[ "$p" =~ ^[0-9]+$ ]] || { err "必须输入数字"; exit 1; }
+    (( p >= 1 && p <= 2000 )) || { err "端口数量建议 1-2000"; exit 1; }
     PORTS_PER_HOST="$p"
   fi
-
   ok "已设置：每台机器业务端口数量 = ${PORTS_PER_HOST}"
   echo "========================================="
 }
 
 init_ports_per_host() {
   if has_existing_nat_rules; then
-    # 有规则：必须从规则推断，不允许默认回20
+    # 有规则：尝试推断，推断失败也不退出（只警告）
     if ! detect_ports_per_host_from_rules; then
-      warn "检测到 NAT 映射规则，但推断端口块失败！"
-      warn "为避免破坏现有规则体系，脚本将退出。"
-      warn "请检查规则中是否存在类似：--dport 41201:41300 且 --to-destination 10.0.0.x"
-      exit 1
+      warn "检测到 NAT 规则，但推断端口块失败。"
+      warn "为避免破坏体系，将临时使用默认：${PORTS_PER_HOST_DEFAULT}（仅影响新增映射）"
+      PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
     fi
   else
-    # 无规则：允许输入
     PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
     choose_ports_per_host_when_empty
   fi
 }
 
-# -----------------------
-# IP forward
-# -----------------------
 enable_forward() {
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
-
   local sysctl_conf="/etc/sysctl.d/99-nixore-ipforward.conf"
   if [[ -d /etc/sysctl.d ]]; then
     echo "net.ipv4.ip_forward=1" > "$sysctl_conf"
@@ -264,9 +202,6 @@ enable_forward() {
   fi
 }
 
-# -----------------------
-# iptables 持久化
-# -----------------------
 persist_rules() {
   info "持久化 iptables 规则到 $RULES_FILE"
   mkdir -p "$(dirname "$RULES_FILE")"
@@ -282,7 +217,6 @@ ensure_restore_service() {
 
   if [[ ! -f "$SYSTEMD_SERVICE" ]]; then
     info "创建 systemd 开机恢复服务: iptables-restore.service"
-
     cat > "$SYSTEMD_SERVICE" <<EOF
 [Unit]
 Description=Restore iptables rules
@@ -298,32 +232,19 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-
     systemctl daemon-reload
     systemctl enable iptables-restore.service >/dev/null
     ok "已启用开机恢复服务"
   fi
 }
 
-# -----------------------
-# 输入校验
-# -----------------------
 validate_host() {
   local n="$1"
-  if ! [[ "$n" =~ ^[0-9]+$ ]]; then
-    err "主机号必须是数字"
-    return 1
-  fi
-  if (( n < MIN_HOST || n > MAX_HOST )); then
-    err "主机号必须在 ${MIN_HOST}-${MAX_HOST} 之间"
-    return 1
-  fi
+  [[ "$n" =~ ^[0-9]+$ ]] || { err "主机号必须是数字"; return 1; }
+  (( n >= MIN_HOST && n <= MAX_HOST )) || { err "主机号必须在 ${MIN_HOST}-${MAX_HOST}"; return 1; }
   return 0
 }
 
-# -----------------------
-# NAT 添加
-# -----------------------
 add_nat() {
   local last="$1"
   validate_host "$last" || return 1
@@ -356,20 +277,18 @@ add_nat() {
   [[ "$AUTO_PERSIST" == "1" ]] && persist_rules
 }
 
-# -----------------------
-# NAT 删除（修复：按现有规则反查删除，找不到就跳过）
-# -----------------------
+# 删除修复：按现有规则反查删除（找不到就跳过）
 del_nat() {
   local last="$1"
   validate_host "$last" || return 1
   local ip="${NET_PREFIX}${last}"
+  local ip_esc="${ip//./\\.}"
 
-  # 找 PREROUTING 里所有与该 IP 相关的规则（包含 :22 与无端口）
   local rules
   rules="$(
     $IPT -t nat -S PREROUTING 2>/dev/null \
       | grep -E -- '-j DNAT' \
-      | grep -F -- "--to-destination $ip" || true
+      | grep -E -- "--to-destination[= ]${ip_esc}([:$]|$)" || true
   )"
 
   if [[ -z "$rules" ]]; then
@@ -377,13 +296,11 @@ del_nat() {
     return 0
   fi
 
-  # 逐条删除：把 -A 替换成 -D
   while read -r r; do
     [[ -z "$r" ]] && continue
     $IPT -t nat ${r/-A /-D } 2>/dev/null || true
   done <<< "$rules"
 
-  # 删除 FORWARD 规则（按 IP）
   $IPT -D FORWARD -d "$ip" -j ACCEPT 2>/dev/null || true
   $IPT -D FORWARD -s "$ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 
@@ -391,16 +308,13 @@ del_nat() {
   [[ "$AUTO_PERSIST" == "1" ]] && persist_rules
 }
 
-# -----------------------
-# 查看 NAT
-# -----------------------
 show_one_nat() {
   local last="$1"
   validate_host "$last" || return 1
   local ip="${NET_PREFIX}${last}"
+  local ip_esc="${ip//./\\.}"
 
-  # 直接通过规则判断是否存在
-  if ! $IPT -t nat -S PREROUTING 2>/dev/null | grep -qF -- "--to-destination $ip"; then
+  if ! $IPT -t nat -S PREROUTING 2>/dev/null | grep -Eq -- "--to-destination[= ]${ip_esc}([:$]|$)"; then
     err "未找到 $ip 的 NAT 规则"
     return 1
   fi
@@ -444,9 +358,6 @@ show_all_nat() {
   echo "每台机器业务端口数量：${PORTS_PER_HOST}"
 }
 
-# -----------------------
-# 菜单
-# -----------------------
 menu() {
   clear
   echo "======== Nixore NAT 映射管理 ========"
@@ -466,67 +377,43 @@ menu() {
   choice="$(strip_cr "$choice")"
 
   case "$choice" in
-    1)
-      read -rp "请输入主机号 (${MIN_HOST}-${MAX_HOST}): " n
-      add_nat "$(strip_cr "$n")"
-      ;;
+    1) read -rp "请输入主机号 (${MIN_HOST}-${MAX_HOST}): " n; add_nat "$(strip_cr "$n")" ;;
     2)
       read -rp "起始主机号 (${MIN_HOST}-${MAX_HOST}): " start
       read -rp "结束主机号 (${MIN_HOST}-${MAX_HOST}): " end
-      start="$(strip_cr "$start")"
-      end="$(strip_cr "$end")"
-
+      start="$(strip_cr "$start")"; end="$(strip_cr "$end")"
       validate_host "$start" || { read -rp "按回车返回菜单..." _; menu; }
       validate_host "$end" || { read -rp "按回车返回菜单..." _; menu; }
       (( start > end )) && { err "起始不能大于结束"; read -rp "按回车返回菜单..." _; menu; }
 
       info "批量添加中 (${start}-${end})..."
-      local old="$AUTO_PERSIST"
-      AUTO_PERSIST=0
+      local old="$AUTO_PERSIST"; AUTO_PERSIST=0
       for (( i=start; i<=end; i++ )); do add_nat "$i"; done
       AUTO_PERSIST="$old"
       persist_rules
       ok "批量添加完成并已持久化 (${start}-${end})"
       ;;
-    3)
-      read -rp "请输入要删除的主机号 (${MIN_HOST}-${MAX_HOST}): " n
-      del_nat "$(strip_cr "$n")"
-      ;;
+    3) read -rp "请输入要删除的主机号 (${MIN_HOST}-${MAX_HOST}): " n; del_nat "$(strip_cr "$n")" ;;
     4)
       read -rp "起始主机号 (${MIN_HOST}-${MAX_HOST}): " start
       read -rp "结束主机号 (${MIN_HOST}-${MAX_HOST}): " end
-      start="$(strip_cr "$start")"
-      end="$(strip_cr "$end")"
-
+      start="$(strip_cr "$start")"; end="$(strip_cr "$end")"
       validate_host "$start" || { read -rp "按回车返回菜单..." _; menu; }
       validate_host "$end" || { read -rp "按回车返回菜单..." _; menu; }
       (( start > end )) && { err "起始不能大于结束"; read -rp "按回车返回菜单..." _; menu; }
 
       info "批量删除中 (${start}-${end})..."
-      local old="$AUTO_PERSIST"
-      AUTO_PERSIST=0
+      local old="$AUTO_PERSIST"; AUTO_PERSIST=0
       for (( i=start; i<=end; i++ )); do del_nat "$i"; done
       AUTO_PERSIST="$old"
       persist_rules
       ok "批量删除完成并已持久化 (${start}-${end})"
       ;;
-    5)
-      read -rp "请输入要查看的主机号 (${MIN_HOST}-${MAX_HOST}): " n
-      show_one_nat "$(strip_cr "$n")"
-      ;;
-    6)
-      show_all_nat
-      ;;
-    7)
-      persist_rules
-      ;;
-    8)
-      echo "退出。"
-      exit 0
-      ;;
-    *)
-      err "无效选项：[$choice]"
-      ;;
+    5) read -rp "请输入要查看的主机号 (${MIN_HOST}-${MAX_HOST}): " n; show_one_nat "$(strip_cr "$n")" ;;
+    6) show_all_nat ;;
+    7) persist_rules ;;
+    8) echo "退出。"; exit 0 ;;
+    *) err "无效选项：[$choice]" ;;
   esac
 
   echo
@@ -534,9 +421,6 @@ menu() {
   menu
 }
 
-# -----------------------
-# 主流程
-# -----------------------
 main() {
   require_root
   install_deps
