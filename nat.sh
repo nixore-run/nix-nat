@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # ===============================================
-# NAT 映射管理脚本 (交互菜单版 v2.6)
+# NAT 映射管理脚本 (交互菜单版 v2.8)
 # - 支持 Debian/Ubuntu/AlmaLinux/Rocky/CentOS
-# - 极速后端检测：直接找第一个 DNAT 到 10.0.0.x 的规则
-# - 有规则：自动推断端口块大小并锁定，不允许修改
-# - 无规则：启动时可输入端口块大小（默认20）
+# - 自动识别 iptables 后端（nft/legacy）并使用存在规则的那套
+# - 启动时从已有 NAT 规则推断端口块：从 100 开始逐个找直到 250
+# - 有规则：端口块锁定，不允许改，防止规则体系乱掉
+# - 无规则：允许输入端口块大小（默认20）
+# - 删除修复：按现有规则反查删除（找不到就跳过，不会假删）
 # - 保留 v2.1 原菜单：查看单个/全部映射等
 # ===============================================
 
@@ -115,11 +117,12 @@ install_deps() {
 }
 
 # -----------------------
-# 极速后端检测：谁能找到一个 DNAT 到 10.0.0.x 就用谁
+# 后端检测：谁有 NAT 规则就用谁
 # -----------------------
 backend_has_nat() {
   local cmd="$1"
   command -v "$cmd" >/dev/null 2>&1 || return 1
+
   "$cmd" -t nat -S PREROUTING 2>/dev/null \
     | grep -E -- '-j DNAT' \
     | grep -E -- "--to-destination ${NET_PREFIX//./\\.}" >/dev/null 2>&1
@@ -146,22 +149,40 @@ has_existing_nat_rules() {
 }
 
 # -----------------------
-# 从已有规则推断端口块大小：取第一个内部IP，再取它的端口范围
+# 端口计算
+# -----------------------
+calc_ports() {
+  local last="$1"
+  SSH_PORT=$((30000 + last))
+  BLOCK_START=$((40000 + (last - MIN_HOST)*PORTS_PER_HOST + 1))
+  BLOCK_END=$((BLOCK_START + PORTS_PER_HOST - 1))
+}
+
+# -----------------------
+# 从规则推断端口块：100 没有就 101、102、… 直到 250
 # -----------------------
 detect_ports_per_host_from_rules() {
-  # 1) 找到一个内部 IP（最小 host）
-  local ip
-  ip="$(
-    $IPT -t nat -S PREROUTING 2>/dev/null \
-      | grep -E -- '-j DNAT' \
-      | grep -oE -- "${NET_PREFIX//./\\.}[0-9]+" \
-      | sort -t'.' -k4,4n \
-      | head -n 1 || true
-  )"
+  local ip="" last=""
 
-  [[ -z "$ip" ]] && return 1
+  # 逐个 host 探测：找到第一个存在 DNAT 的
+  for ((i=MIN_HOST; i<=MAX_HOST; i++)); do
+    ip="${NET_PREFIX}${i}"
+    if $IPT -t nat -S PREROUTING 2>/dev/null | grep -qF -- "--to-destination $ip"; then
+      last="$i"
+      break
+    fi
+    # 也兼容 --to-destination 10.0.0.x:22
+    if $IPT -t nat -S PREROUTING 2>/dev/null | grep -qF -- "--to-destination ${ip}:"; then
+      last="$i"
+      break
+    fi
+  done
 
-  # 2) 找该 IP 对应的“业务端口范围规则”（有 a:b 的那个）
+  [[ -z "$last" ]] && return 1
+
+  ip="${NET_PREFIX}${last}"
+
+  # 找该IP对应的业务端口范围规则（包含 a:b 的）
   local range
   range="$(
     $IPT -t nat -S PREROUTING 2>/dev/null \
@@ -189,7 +210,7 @@ detect_ports_per_host_from_rules() {
 choose_ports_per_host_when_empty() {
   echo "========================================="
   echo "未检测到现有 NAT 映射规则。"
-  echo "请自定义每台机器映射的业务端口数量。"
+  echo "你可以自定义每台机器映射的业务端口数量。"
   echo "默认：${PORTS_PER_HOST_DEFAULT}"
   read -rp "请输入每台机器业务端口数量（回车默认${PORTS_PER_HOST_DEFAULT}）: " p
   p="$(strip_cr "$p")"
@@ -214,24 +235,18 @@ choose_ports_per_host_when_empty() {
 
 init_ports_per_host() {
   if has_existing_nat_rules; then
+    # 有规则：必须从规则推断，不允许默认回20
     if ! detect_ports_per_host_from_rules; then
-      warn "检测到 NAT 映射规则，但未能推断端口块大小，兜底使用默认：${PORTS_PER_HOST_DEFAULT}"
-      PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
+      warn "检测到 NAT 映射规则，但推断端口块失败！"
+      warn "为避免破坏现有规则体系，脚本将退出。"
+      warn "请检查规则中是否存在类似：--dport 41201:41300 且 --to-destination 10.0.0.x"
+      exit 1
     fi
   else
+    # 无规则：允许输入
     PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
     choose_ports_per_host_when_empty
   fi
-}
-
-# -----------------------
-# 端口计算
-# -----------------------
-calc_ports() {
-  local last="$1"
-  SSH_PORT=$((30000 + last))
-  BLOCK_START=$((40000 + (last - MIN_HOST)*PORTS_PER_HOST + 1))
-  BLOCK_END=$((BLOCK_START + PORTS_PER_HOST - 1))
 }
 
 # -----------------------
@@ -307,12 +322,11 @@ validate_host() {
 }
 
 # -----------------------
-# NAT 添加/删除
+# NAT 添加
 # -----------------------
 add_nat() {
   local last="$1"
   validate_host "$last" || return 1
-
   local ip="${NET_PREFIX}${last}"
   calc_ports "$last"
 
@@ -342,20 +356,38 @@ add_nat() {
   [[ "$AUTO_PERSIST" == "1" ]] && persist_rules
 }
 
+# -----------------------
+# NAT 删除（修复：按现有规则反查删除，找不到就跳过）
+# -----------------------
 del_nat() {
   local last="$1"
   validate_host "$last" || return 1
-
   local ip="${NET_PREFIX}${last}"
-  calc_ports "$last"
 
-  $IPT -t nat -D PREROUTING -p tcp --dport "$SSH_PORT" -j DNAT --to-destination "${ip}:22" 2>/dev/null || true
-  $IPT -t nat -D PREROUTING -p tcp --dport "${BLOCK_START}:${BLOCK_END}" -j DNAT --to-destination "$ip" 2>/dev/null || true
-  $IPT -t nat -D PREROUTING -p udp --dport "${BLOCK_START}:${BLOCK_END}" -j DNAT --to-destination "$ip" 2>/dev/null || true
+  # 找 PREROUTING 里所有与该 IP 相关的规则（包含 :22 与无端口）
+  local rules
+  rules="$(
+    $IPT -t nat -S PREROUTING 2>/dev/null \
+      | grep -E -- '-j DNAT' \
+      | grep -F -- "--to-destination $ip" || true
+  )"
+
+  if [[ -z "$rules" ]]; then
+    warn "跳过：未找到 $ip 的 NAT 映射规则"
+    return 0
+  fi
+
+  # 逐条删除：把 -A 替换成 -D
+  while read -r r; do
+    [[ -z "$r" ]] && continue
+    $IPT -t nat ${r/-A /-D } 2>/dev/null || true
+  done <<< "$rules"
+
+  # 删除 FORWARD 规则（按 IP）
   $IPT -D FORWARD -d "$ip" -j ACCEPT 2>/dev/null || true
   $IPT -D FORWARD -s "$ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 
-  ok "已删除 $ip 的映射"
+  ok "已删除 $ip 的映射（按现有规则反查删除）"
   [[ "$AUTO_PERSIST" == "1" ]] && persist_rules
 }
 
@@ -365,19 +397,20 @@ del_nat() {
 show_one_nat() {
   local last="$1"
   validate_host "$last" || return 1
-
   local ip="${NET_PREFIX}${last}"
-  calc_ports "$last"
 
-  if $IPT -t nat -S PREROUTING 2>/dev/null | grep -qF "$ip"; then
-    echo "----------------------------------"
-    echo "内部 IP  : $ip"
-    echo "SSH端口  : $SSH_PORT"
-    echo "业务端口 : ${BLOCK_START}-${BLOCK_END} （每台 ${PORTS_PER_HOST} 个）"
-    echo "----------------------------------"
-  else
+  # 直接通过规则判断是否存在
+  if ! $IPT -t nat -S PREROUTING 2>/dev/null | grep -qF -- "--to-destination $ip"; then
     err "未找到 $ip 的 NAT 规则"
+    return 1
   fi
+
+  calc_ports "$last"
+  echo "----------------------------------"
+  echo "内部 IP  : $ip"
+  echo "SSH端口  : $SSH_PORT"
+  echo "业务端口 : ${BLOCK_START}-${BLOCK_END} （每台 ${PORTS_PER_HOST} 个）"
+  echo "----------------------------------"
 }
 
 show_all_nat() {
@@ -417,6 +450,7 @@ show_all_nat() {
 menu() {
   clear
   echo "======== Nixore NAT 映射管理 ========"
+  echo "iptables 后端：$IPT"
   echo "当前每台机器业务端口数量：${PORTS_PER_HOST}"
   echo "-----------------------------------------"
   echo "1. 添加单个映射"
@@ -432,39 +466,67 @@ menu() {
   choice="$(strip_cr "$choice")"
 
   case "$choice" in
-    1) read -rp "请输入主机号 (${MIN_HOST}-${MAX_HOST}): " n; add_nat "$(strip_cr "$n")" ;;
+    1)
+      read -rp "请输入主机号 (${MIN_HOST}-${MAX_HOST}): " n
+      add_nat "$(strip_cr "$n")"
+      ;;
     2)
       read -rp "起始主机号 (${MIN_HOST}-${MAX_HOST}): " start
       read -rp "结束主机号 (${MIN_HOST}-${MAX_HOST}): " end
       start="$(strip_cr "$start")"
       end="$(strip_cr "$end")"
+
       validate_host "$start" || { read -rp "按回车返回菜单..." _; menu; }
       validate_host "$end" || { read -rp "按回车返回菜单..." _; menu; }
       (( start > end )) && { err "起始不能大于结束"; read -rp "按回车返回菜单..." _; menu; }
+
       info "批量添加中 (${start}-${end})..."
-      local old="$AUTO_PERSIST"; AUTO_PERSIST=0
+      local old="$AUTO_PERSIST"
+      AUTO_PERSIST=0
       for (( i=start; i<=end; i++ )); do add_nat "$i"; done
-      AUTO_PERSIST="$old"; persist_rules; ok "批量添加完成并已持久化 (${start}-${end})"
+      AUTO_PERSIST="$old"
+      persist_rules
+      ok "批量添加完成并已持久化 (${start}-${end})"
       ;;
-    3) read -rp "请输入要删除的主机号 (${MIN_HOST}-${MAX_HOST}): " n; del_nat "$(strip_cr "$n")" ;;
+    3)
+      read -rp "请输入要删除的主机号 (${MIN_HOST}-${MAX_HOST}): " n
+      del_nat "$(strip_cr "$n")"
+      ;;
     4)
       read -rp "起始主机号 (${MIN_HOST}-${MAX_HOST}): " start
       read -rp "结束主机号 (${MIN_HOST}-${MAX_HOST}): " end
       start="$(strip_cr "$start")"
       end="$(strip_cr "$end")"
+
       validate_host "$start" || { read -rp "按回车返回菜单..." _; menu; }
       validate_host "$end" || { read -rp "按回车返回菜单..." _; menu; }
       (( start > end )) && { err "起始不能大于结束"; read -rp "按回车返回菜单..." _; menu; }
+
       info "批量删除中 (${start}-${end})..."
-      local old="$AUTO_PERSIST"; AUTO_PERSIST=0
+      local old="$AUTO_PERSIST"
+      AUTO_PERSIST=0
       for (( i=start; i<=end; i++ )); do del_nat "$i"; done
-      AUTO_PERSIST="$old"; persist_rules; ok "批量删除完成并已持久化 (${start}-${end})"
+      AUTO_PERSIST="$old"
+      persist_rules
+      ok "批量删除完成并已持久化 (${start}-${end})"
       ;;
-    5) read -rp "请输入要查看的主机号 (${MIN_HOST}-${MAX_HOST}): " n; show_one_nat "$(strip_cr "$n")" ;;
-    6) show_all_nat ;;
-    7) persist_rules ;;
-    8) echo "退出。"; exit 0 ;;
-    *) err "无效选项：[$choice]" ;;
+    5)
+      read -rp "请输入要查看的主机号 (${MIN_HOST}-${MAX_HOST}): " n
+      show_one_nat "$(strip_cr "$n")"
+      ;;
+    6)
+      show_all_nat
+      ;;
+    7)
+      persist_rules
+      ;;
+    8)
+      echo "退出。"
+      exit 0
+      ;;
+    *)
+      err "无效选项：[$choice]"
+      ;;
   esac
 
   echo
