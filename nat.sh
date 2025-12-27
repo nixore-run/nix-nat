@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ===============================================
-# NAT 映射管理脚本 (交互菜单版 v2.4)
+# NAT 映射管理脚本 (交互菜单版 v2.5)
 # - 支持 Debian/Ubuntu/AlmaLinux/Rocky/CentOS
-# - 自动识别 iptables 后端（nft/legacy）
-# - 启动时检测已有 NAT 规则：推断端口块大小并锁定
+# - 最强后端检测：iptables / iptables-legacy / iptables-nft 统计规则数量选最大
+# - 启动时检测已有 NAT 规则：推断端口块大小并锁定（有规则不允许改）
 # - 无规则才允许输入端口块大小（默认20）
 # - 保留 v2.1 原菜单：查看单个/全部映射等
 # ===============================================
@@ -18,18 +18,12 @@ NET_PREFIX="10.0.0."
 MIN_HOST=100
 MAX_HOST=250
 
-# 默认每台机器业务端口数量（无规则时可输入修改）
 PORTS_PER_HOST_DEFAULT=20
 PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
 
-# 自动持久化：单个操作是否立即保存（批量时会临时关闭）
 AUTO_PERSIST="${AUTO_PERSIST:-1}"
-
-# 持久化文件位置
 RULES_FILE="${RULES_FILE:-/etc/iptables/rules.v4}"
 SYSTEMD_SERVICE="${SYSTEMD_SERVICE:-/etc/systemd/system/iptables-restore.service}"
-
-# 是否自动安装依赖（默认是）
 AUTO_INSTALL_DEPS="${AUTO_INSTALL_DEPS:-1}"
 
 # -----------------------
@@ -39,8 +33,7 @@ SSH_PORT=""
 BLOCK_START=""
 BLOCK_END=""
 
-# iptables 后端命令（自动确定）
-IPT="iptables"         # iptables / iptables-legacy / iptables-nft
+IPT="iptables"
 IPT_SAVE="iptables-save"
 IPT_RESTORE="iptables-restore"
 
@@ -52,7 +45,6 @@ ok()   { echo -e "\033[1;32m✅\033[0m $*"; }
 warn() { echo -e "\033[1;33m⚠️\033[0m $*"; }
 err()  { echo -e "\033[1;31m❌\033[0m $*"; }
 
-# 去掉 \r（修复粘贴/CRLF 造成的无效选项）
 strip_cr() {
   local v="${1:-}"
   v="${v//$'\r'/}"
@@ -128,49 +120,53 @@ install_deps() {
 }
 
 # -----------------------
-# 自动选择 iptables 后端（核心）
+# 最强后端检测（统计规则数量选最大）
 # -----------------------
-pick_backend_save_restore() {
-  case "$IPT" in
-    iptables-legacy)
-      IPT_SAVE="iptables-save"
-      IPT_RESTORE="iptables-restore"
-      ;;
-    iptables-nft)
-      IPT_SAVE="iptables-save"
-      IPT_RESTORE="iptables-restore"
-      ;;
-    *)
-      IPT_SAVE="iptables-save"
-      IPT_RESTORE="iptables-restore"
-      ;;
-  esac
+count_nat_rules_for_backend() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo 0
+    return
+  fi
+
+  # 统计：PREROUTING 中 DNAT 且 to-destination 指向 NET_PREFIX（10.0.0.）
+  # 同时兼容 :22 或无端口
+  "$cmd" -t nat -S PREROUTING 2>/dev/null \
+    | grep -E -- '-j DNAT' \
+    | grep -E -- "--to-destination ${NET_PREFIX//./\\.}" \
+    | wc -l | tr -d ' '
 }
 
 detect_iptables_backend() {
-  # 优先选择“已经有 10.0.0.x DNAT 规则”的后端
-  local candidates=("iptables-legacy" "iptables" "iptables-nft")
+  local best_cmd="iptables"
+  local best_cnt=0
 
-  for c in "${candidates[@]}"; do
-    if command -v "$c" >/dev/null 2>&1; then
-      if "$c" -t nat -S PREROUTING 2>/dev/null | grep -qE -- '--to-destination 10\.0\.0\.'; then
-        IPT="$c"
-        pick_backend_save_restore
-        ok "检测到已有 NAT 规则，使用 iptables 后端：$IPT"
-        return 0
-      fi
+  local c cnt
+  for c in iptables iptables-legacy iptables-nft; do
+    cnt="$(count_nat_rules_for_backend "$c")"
+    info "后端检测：$c NAT规则数=$cnt"
+    if (( cnt > best_cnt )); then
+      best_cnt="$cnt"
+      best_cmd="$c"
     fi
   done
 
-  # 没检测到就默认 iptables（nft）
-  IPT="iptables"
-  pick_backend_save_restore
-  info "未检测到现有 NAT 规则，默认使用 iptables 后端：$IPT"
-  return 0
+  IPT="$best_cmd"
+  ok "选择 iptables 后端：$IPT （匹配NAT规则数=$best_cnt）"
+
+  # save/restore 保持系统默认（最稳），不强行 legacy-save
+  IPT_SAVE="iptables-save"
+  IPT_RESTORE="iptables-restore"
+}
+
+has_existing_nat_rules() {
+  local cnt
+  cnt="$(count_nat_rules_for_backend "$IPT")"
+  (( cnt > 0 ))
 }
 
 # -----------------------
-# 端口计算（动态端口块）
+# 端口计算
 # -----------------------
 calc_ports() {
   local last="$1"
@@ -180,22 +176,17 @@ calc_ports() {
 }
 
 # -----------------------
-# 判断是否已有 NAT 映射
+# 推断端口块大小
 # -----------------------
-has_existing_nat_rules() {
-  $IPT -t nat -S PREROUTING 2>/dev/null | grep -qE -- '--to-destination 10\.0\.0\.' && return 0
-  return 1
-}
-
-# 从现有规则推断端口块大小（必须命中 to-destination 10.0.0.x）
 detect_ports_per_host_from_rules() {
+  # 从业务端口范围规则提取第一个 a:b，然后算 b-a+1
   local range
   range="$(
     $IPT -t nat -S PREROUTING 2>/dev/null \
-      | grep -E -- '--to-destination 10\.0\.0\.' \
-      | grep -E -- '--dport [0-9]+:[0-9]+' \
-      | head -n 1 \
-      | grep -oE -- '[0-9]+:[0-9]+' || true
+      | grep -E -- '-j DNAT' \
+      | grep -E -- "--to-destination ${NET_PREFIX//./\\.}" \
+      | grep -oE -- '[0-9]+:[0-9]+' \
+      | head -n 1 || true
   )"
 
   if [[ -z "$range" ]]; then
@@ -244,22 +235,18 @@ choose_ports_per_host_when_empty() {
 
 init_ports_per_host() {
   if has_existing_nat_rules; then
-    # 有规则：推断并锁定，不允许改
     if ! detect_ports_per_host_from_rules; then
-      warn "检测到 NAT 映射规则，但未能推断端口块大小。"
-      warn "请确认规则里存在类似：--dport 41201:41300 且 --to-destination 10.0.0.x"
+      warn "检测到 NAT 映射规则，但未能推断端口块大小，兜底使用默认：${PORTS_PER_HOST_DEFAULT}"
       PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
-      warn "兜底使用默认：${PORTS_PER_HOST_DEFAULT}"
     fi
   else
-    # 无规则：允许输入
     PORTS_PER_HOST="$PORTS_PER_HOST_DEFAULT"
     choose_ports_per_host_when_empty
   fi
 }
 
 # -----------------------
-# IP forward 开启 + 持久化
+# IP forward
 # -----------------------
 enable_forward() {
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -274,7 +261,7 @@ enable_forward() {
 }
 
 # -----------------------
-# iptables 持久化（通用）
+# iptables 持久化
 # -----------------------
 persist_rules() {
   info "持久化 iptables 规则到 $RULES_FILE"
@@ -346,20 +333,16 @@ add_nat() {
 
   enable_forward
 
-  # 出口 masquerade（只加一次）
   $IPT -t nat -C POSTROUTING -s "$SUBNET_CIDR" -j MASQUERADE 2>/dev/null || \
     $IPT -t nat -A POSTROUTING -s "$SUBNET_CIDR" -j MASQUERADE
 
-  # FORWARD 规则
   $IPT -C FORWARD -d "$ip" -j ACCEPT 2>/dev/null || $IPT -A FORWARD -d "$ip" -j ACCEPT
   $IPT -C FORWARD -s "$ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
     $IPT -A FORWARD -s "$ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-  # DNAT：ssh
   $IPT -t nat -C PREROUTING -p tcp --dport "$SSH_PORT" -j DNAT --to-destination "${ip}:22" 2>/dev/null || \
     $IPT -t nat -A PREROUTING -p tcp --dport "$SSH_PORT" -j DNAT --to-destination "${ip}:22"
 
-  # DNAT：业务端口 tcp/udp
   $IPT -t nat -C PREROUTING -p tcp --dport "${BLOCK_START}:${BLOCK_END}" -j DNAT --to-destination "$ip" 2>/dev/null || \
     $IPT -t nat -A PREROUTING -p tcp --dport "${BLOCK_START}:${BLOCK_END}" -j DNAT --to-destination "$ip"
 
@@ -367,10 +350,7 @@ add_nat() {
     $IPT -t nat -A PREROUTING -p udp --dport "${BLOCK_START}:${BLOCK_END}" -j DNAT --to-destination "$ip"
 
   ok "已添加映射"
-
-  if [[ "$AUTO_PERSIST" == "1" ]]; then
-    persist_rules
-  fi
+  [[ "$AUTO_PERSIST" == "1" ]] && persist_rules
 }
 
 del_nat() {
@@ -387,10 +367,7 @@ del_nat() {
   $IPT -D FORWARD -s "$ip" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 
   ok "已删除 $ip 的映射"
-
-  if [[ "$AUTO_PERSIST" == "1" ]]; then
-    persist_rules
-  fi
+  [[ "$AUTO_PERSIST" == "1" ]] && persist_rules
 }
 
 # -----------------------
@@ -403,9 +380,7 @@ show_one_nat() {
   local ip="${NET_PREFIX}${last}"
   calc_ports "$last"
 
-  local found
-  found="$($IPT -t nat -S PREROUTING 2>/dev/null | grep -F "$ip" || true)"
-  if [[ -n "$found" ]]; then
+  if $IPT -t nat -S PREROUTING 2>/dev/null | grep -qF "$ip"; then
     echo "----------------------------------"
     echo "内部 IP  : $ip"
     echo "SSH端口  : $SSH_PORT"
@@ -425,7 +400,7 @@ show_all_nat() {
   local lasts
   lasts="$(
     $IPT -t nat -S PREROUTING 2>/dev/null \
-      | grep -oE '10\.0\.0\.[0-9]+' \
+      | grep -oE "${NET_PREFIX//./\\.}[0-9]+" \
       | awk -F'.' '{print $4}' \
       | sort -n | uniq || true
   )"
@@ -448,7 +423,7 @@ show_all_nat() {
 }
 
 # -----------------------
-# 菜单（保留 v2.1 结构）
+# 菜单
 # -----------------------
 menu() {
   clear
@@ -562,13 +537,10 @@ menu() {
 main() {
   require_root
   install_deps
-
-  # 关键：先选后端，再推断端口块
   detect_iptables_backend
   ensure_restore_service
   enable_forward
   init_ports_per_host
-
   menu
 }
 
