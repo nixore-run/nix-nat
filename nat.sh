@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ===============================================
-# NAT 映射管理脚本 (交互菜单版 v2.5)
+# NAT 映射管理脚本 (交互菜单版 v2.6)
 # - 支持 Debian/Ubuntu/AlmaLinux/Rocky/CentOS
-# - 最强后端检测：iptables / iptables-legacy / iptables-nft 统计规则数量选最大
-# - 启动时检测已有 NAT 规则：推断端口块大小并锁定（有规则不允许改）
-# - 无规则才允许输入端口块大小（默认20）
+# - 极速后端检测：直接找第一个 DNAT 到 10.0.0.x 的规则
+# - 有规则：自动推断端口块大小并锁定，不允许修改
+# - 无规则：启动时可输入端口块大小（默认20）
 # - 保留 v2.1 原菜单：查看单个/全部映射等
 # ===============================================
 
@@ -111,87 +111,66 @@ install_deps() {
       ;;
   esac
 
-  if command -v iptables >/dev/null 2>&1 && command -v iptables-save >/dev/null 2>&1 && command -v iptables-restore >/dev/null 2>&1; then
-    ok "依赖安装完成"
-  else
-    err "依赖安装失败，请检查系统软件源"
-    exit 1
-  fi
+  ok "依赖安装完成"
 }
 
 # -----------------------
-# 最强后端检测（统计规则数量选最大）
+# 极速后端检测：谁能找到一个 DNAT 到 10.0.0.x 就用谁
 # -----------------------
-count_nat_rules_for_backend() {
+backend_has_nat() {
   local cmd="$1"
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo 0
-    return
-  fi
-
-  # 统计：PREROUTING 中 DNAT 且 to-destination 指向 NET_PREFIX（10.0.0.）
-  # 同时兼容 :22 或无端口
+  command -v "$cmd" >/dev/null 2>&1 || return 1
   "$cmd" -t nat -S PREROUTING 2>/dev/null \
     | grep -E -- '-j DNAT' \
-    | grep -E -- "--to-destination ${NET_PREFIX//./\\.}" \
-    | wc -l | tr -d ' '
+    | grep -E -- "--to-destination ${NET_PREFIX//./\\.}" >/dev/null 2>&1
 }
 
 detect_iptables_backend() {
-  local best_cmd="iptables"
-  local best_cnt=0
+  local candidates=("iptables" "iptables-legacy" "iptables-nft")
 
-  local c cnt
-  for c in iptables iptables-legacy iptables-nft; do
-    cnt="$(count_nat_rules_for_backend "$c")"
-    info "后端检测：$c NAT规则数=$cnt"
-    if (( cnt > best_cnt )); then
-      best_cnt="$cnt"
-      best_cmd="$c"
+  for c in "${candidates[@]}"; do
+    if backend_has_nat "$c"; then
+      IPT="$c"
+      ok "检测到已有 NAT 规则，使用 iptables 后端：$IPT"
+      return 0
     fi
   done
 
-  IPT="$best_cmd"
-  ok "选择 iptables 后端：$IPT （匹配NAT规则数=$best_cnt）"
-
-  # save/restore 保持系统默认（最稳），不强行 legacy-save
-  IPT_SAVE="iptables-save"
-  IPT_RESTORE="iptables-restore"
+  IPT="iptables"
+  info "未检测到现有 NAT 规则，默认使用：$IPT"
+  return 0
 }
 
 has_existing_nat_rules() {
-  local cnt
-  cnt="$(count_nat_rules_for_backend "$IPT")"
-  (( cnt > 0 ))
+  backend_has_nat "$IPT"
 }
 
 # -----------------------
-# 端口计算
-# -----------------------
-calc_ports() {
-  local last="$1"
-  SSH_PORT=$((30000 + last))
-  BLOCK_START=$((40000 + (last - MIN_HOST)*PORTS_PER_HOST + 1))
-  BLOCK_END=$((BLOCK_START + PORTS_PER_HOST - 1))
-}
-
-# -----------------------
-# 推断端口块大小
+# 从已有规则推断端口块大小：取第一个内部IP，再取它的端口范围
 # -----------------------
 detect_ports_per_host_from_rules() {
-  # 从业务端口范围规则提取第一个 a:b，然后算 b-a+1
+  # 1) 找到一个内部 IP（最小 host）
+  local ip
+  ip="$(
+    $IPT -t nat -S PREROUTING 2>/dev/null \
+      | grep -E -- '-j DNAT' \
+      | grep -oE -- "${NET_PREFIX//./\\.}[0-9]+" \
+      | sort -t'.' -k4,4n \
+      | head -n 1 || true
+  )"
+
+  [[ -z "$ip" ]] && return 1
+
+  # 2) 找该 IP 对应的“业务端口范围规则”（有 a:b 的那个）
   local range
   range="$(
     $IPT -t nat -S PREROUTING 2>/dev/null \
-      | grep -E -- '-j DNAT' \
-      | grep -E -- "--to-destination ${NET_PREFIX//./\\.}" \
+      | grep -F -- "$ip" \
       | grep -oE -- '[0-9]+:[0-9]+' \
       | head -n 1 || true
   )"
 
-  if [[ -z "$range" ]]; then
-    return 1
-  fi
+  [[ -z "$range" ]] && return 1
 
   local start end size
   start="${range%:*}"
@@ -200,7 +179,7 @@ detect_ports_per_host_from_rules() {
 
   if (( size > 0 && size <= 65535 )); then
     PORTS_PER_HOST="$size"
-    ok "推断端口块大小：每台业务端口数量 = ${PORTS_PER_HOST}（来自 ${start}-${end}）"
+    ok "检测到现有规则：$ip 端口范围 ${start}-${end} → 每台业务端口数量 = $PORTS_PER_HOST"
     return 0
   fi
 
@@ -246,6 +225,16 @@ init_ports_per_host() {
 }
 
 # -----------------------
+# 端口计算
+# -----------------------
+calc_ports() {
+  local last="$1"
+  SSH_PORT=$((30000 + last))
+  BLOCK_START=$((40000 + (last - MIN_HOST)*PORTS_PER_HOST + 1))
+  BLOCK_END=$((BLOCK_START + PORTS_PER_HOST - 1))
+}
+
+# -----------------------
 # IP forward
 # -----------------------
 enable_forward() {
@@ -266,13 +255,13 @@ enable_forward() {
 persist_rules() {
   info "持久化 iptables 规则到 $RULES_FILE"
   mkdir -p "$(dirname "$RULES_FILE")"
-  $IPT_SAVE > "$RULES_FILE"
+  iptables-save > "$RULES_FILE"
   ok "规则已保存"
 }
 
 ensure_restore_service() {
   if ! command -v systemctl >/dev/null 2>&1; then
-    warn "未检测到 systemd，无法自动开机恢复规则。你需要手动设置开机执行：$IPT_RESTORE < $RULES_FILE"
+    warn "未检测到 systemd，无法自动开机恢复规则。你需要手动设置开机执行：iptables-restore < $RULES_FILE"
     return
   fi
 
@@ -444,86 +433,39 @@ menu() {
   choice="$(strip_cr "$choice")"
 
   case "$choice" in
-    1)
-      read -rp "请输入主机号 (${MIN_HOST}-${MAX_HOST}): " n
-      n="$(strip_cr "$n")"
-      add_nat "$n"
-      ;;
+    1) read -rp "请输入主机号 (${MIN_HOST}-${MAX_HOST}): " n; add_nat "$(strip_cr "$n")" ;;
     2)
       read -rp "起始主机号 (${MIN_HOST}-${MAX_HOST}): " start
-      start="$(strip_cr "$start")"
       read -rp "结束主机号 (${MIN_HOST}-${MAX_HOST}): " end
+      start="$(strip_cr "$start")"
       end="$(strip_cr "$end")"
-
       validate_host "$start" || { read -rp "按回车返回菜单..." _; menu; }
       validate_host "$end" || { read -rp "按回车返回菜单..." _; menu; }
-
-      if (( start > end )); then
-        err "起始不能大于结束"
-        read -rp "按回车返回菜单..." _
-        menu
-      fi
-
-      info "批量添加中 (${start}-${end})...（每台 ${PORTS_PER_HOST} 个业务端口）"
-      local old="$AUTO_PERSIST"
-      AUTO_PERSIST=0
-      for (( i=start; i<=end; i++ )); do
-        add_nat "$i"
-      done
-      AUTO_PERSIST="$old"
-
-      persist_rules
-      ok "批量添加完成并已持久化 (${start}-${end})"
+      (( start > end )) && { err "起始不能大于结束"; read -rp "按回车返回菜单..." _; menu; }
+      info "批量添加中 (${start}-${end})..."
+      local old="$AUTO_PERSIST"; AUTO_PERSIST=0
+      for (( i=start; i<=end; i++ )); do add_nat "$i"; done
+      AUTO_PERSIST="$old"; persist_rules; ok "批量添加完成并已持久化 (${start}-${end})"
       ;;
-    3)
-      read -rp "请输入要删除的主机号 (${MIN_HOST}-${MAX_HOST}): " n
-      n="$(strip_cr "$n")"
-      del_nat "$n"
-      ;;
+    3) read -rp "请输入要删除的主机号 (${MIN_HOST}-${MAX_HOST}): " n; del_nat "$(strip_cr "$n")" ;;
     4)
       read -rp "起始主机号 (${MIN_HOST}-${MAX_HOST}): " start
-      start="$(strip_cr "$start")"
       read -rp "结束主机号 (${MIN_HOST}-${MAX_HOST}): " end
+      start="$(strip_cr "$start")"
       end="$(strip_cr "$end")"
-
       validate_host "$start" || { read -rp "按回车返回菜单..." _; menu; }
       validate_host "$end" || { read -rp "按回车返回菜单..." _; menu; }
-
-      if (( start > end )); then
-        err "起始不能大于结束"
-        read -rp "按回车返回菜单..." _
-        menu
-      fi
-
+      (( start > end )) && { err "起始不能大于结束"; read -rp "按回车返回菜单..." _; menu; }
       info "批量删除中 (${start}-${end})..."
-      local old="$AUTO_PERSIST"
-      AUTO_PERSIST=0
-      for (( i=start; i<=end; i++ )); do
-        del_nat "$i"
-      done
-      AUTO_PERSIST="$old"
-
-      persist_rules
-      ok "批量删除完成并已持久化 (${start}-${end})"
+      local old="$AUTO_PERSIST"; AUTO_PERSIST=0
+      for (( i=start; i<=end; i++ )); do del_nat "$i"; done
+      AUTO_PERSIST="$old"; persist_rules; ok "批量删除完成并已持久化 (${start}-${end})"
       ;;
-    5)
-      read -rp "请输入要查看的主机号 (${MIN_HOST}-${MAX_HOST}): " n
-      n="$(strip_cr "$n")"
-      show_one_nat "$n"
-      ;;
-    6)
-      show_all_nat
-      ;;
-    7)
-      persist_rules
-      ;;
-    8)
-      echo "退出。"
-      exit 0
-      ;;
-    *)
-      err "无效选项：[$choice]"
-      ;;
+    5) read -rp "请输入要查看的主机号 (${MIN_HOST}-${MAX_HOST}): " n; show_one_nat "$(strip_cr "$n")" ;;
+    6) show_all_nat ;;
+    7) persist_rules ;;
+    8) echo "退出。"; exit 0 ;;
+    *) err "无效选项：[$choice]" ;;
   esac
 
   echo
