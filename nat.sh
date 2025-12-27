@@ -189,7 +189,7 @@ detect_ports_per_host_from_rules() {
 choose_ports_per_host_when_empty() {
   echo "========================================="
   echo "未检测到现有 NAT 映射规则。"
-  echo "你可以自定义每台机器映射的业务端口数量。"
+  echo "请自定义每台机器映射的业务端口数量。"
   echo "默认：${PORTS_PER_HOST_DEFAULT}"
   read -rp "请输入每台机器业务端口数量（回车默认${PORTS_PER_HOST_DEFAULT}）: " p
   p="$(strip_cr "$p")"
